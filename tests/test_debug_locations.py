@@ -189,6 +189,26 @@ class DeepChainModel(nn.Module):
         return x
 
 
+class _Adapter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.down = nn.Linear(8, 2, bias=False)
+        self.up = nn.Linear(2, 8, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class _AdaptedBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(8, 8)
+        self.adapter = _Adapter()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x) + self.adapter(x)
+
+
 def _convert(model: nn.Module, depth_input: torch.Tensor) -> object:
     exported_program: ExportedProgram = torch.export.export(
         model.eval(), (depth_input,)
@@ -271,3 +291,33 @@ def test_output_maps_survive_deferred_operation_ids() -> None:
     asm = program._mlir_module.operation.get_asm(enable_debug_info=True)
 
     assert "output_maps" in asm, "no output maps were recorded"
+
+
+def test_externalized_operations_keep_their_debug_locations() -> None:
+    """Outlined operations still get IDs, even though outlining moves them.
+
+    IDs are assigned once the graph body is complete, which has to happen *before* the
+    grouping rewrites: an operation that has been outlined into its own graph is no longer
+    reachable from the graph it was converted into, and would never be given a location.
+    """
+    exported_program: ExportedProgram = torch.export.export(
+        _AdaptedBlock().eval(), (torch.randn(1, 8),)
+    )
+    exported_program = exported_program.run_decompositions(get_decomp_table())
+
+    converter: TorchConverter = TorchConverter()
+    converter._set_externalize_group("_Adapter", "adapters")
+    converter.add_exported_program(
+        exported_program, entrypoint_name="f", input_names=["x"], output_names=["y"]
+    )
+    program = converter.to_coreai()
+
+    module_operation = program._mlir_module.operation
+    assert "adapters" in str(module_operation), "expected the adapter to be outlined"
+
+    without_id = [
+        operation.name
+        for operation in _get_nested_operations(module_operation)
+        if get_operation_id(operation) is None
+    ]
+    assert not without_id, f"operations left without an ID: {sorted(set(without_id))}"

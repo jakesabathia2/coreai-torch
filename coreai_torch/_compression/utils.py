@@ -158,19 +158,35 @@ def _inject_subbyte_in_lut(program: ExportedProgram) -> ExportedProgram:
                 indices = indices_args[0]
                 lut = lut_args[0]
                 indices_name = indices.name
+                passthrough = None
             elif node.args[0].name.startswith("ifp_constant") and node.args[
                 1
             ].name.startswith("ifp_constant"):
                 # we have some indirection of a ifp node hopefully
                 lut, indices = node.args[0:2]
                 indices_name = indices.args[0].name
+                passthrough = indices
             # The second last dimension or the last dimension of the lut tensor represents the number of palettes, which equals to 2**nbits, we get the
             # nbits from it. We update the annotation of uint8 in the indices
             # tensor to the corresponding torch data type, like torch.uint4
             # or torch.uint2 according to the inferred nbits.
-            # LUT shape is (..., num_palettes, cluster_dim), so num_palettes
-            # is always at shape[-2].
-            num_palettes = lut.meta["val"].shape[-2]
+            #
+            # The palette axis depends on the lut layout, so it is selected by rank:
+            # the wrong axis fails silently, packing indices at a plausible wrong nbits.
+            lut_shape = lut.meta["val"].shape
+            indices_val = indices.meta.get("val")
+            in_coreai_layout = (
+                indices_val is None or len(lut_shape) == indices_val.ndim + 2
+            )
+            num_palettes = lut_shape[-2 if in_coreai_layout else -1]
+
+            if num_palettes < 2 or num_palettes & (num_palettes - 1):
+                msg = (
+                    f"lut of shape {tuple(lut_shape)} for {node.target.name()} has "
+                    f"{num_palettes} palettes, which is not a power of two; the "
+                    f"palette count could not be located in this layout"
+                )
+                raise RuntimeError(msg)
             nbits = int(math.log2(num_palettes))
 
             if nbits not in PALETTIZATION_SUPPORT_NBITS:
@@ -190,6 +206,16 @@ def _inject_subbyte_in_lut(program: ExportedProgram) -> ExportedProgram:
                 program.state_dict[input_spec.target],
                 nbits,
             )
+
+            if passthrough is not None:
+                # The packed state dict makes the placeholder convert to ui<nbits>, but a
+                # custom op's fake kernel cannot carry a sub-byte dtype, so a node passing
+                # the indices through still claims uint8 and its lowering fails the result
+                # type check. Re-annotate it to match what the placeholder now converts to.
+                val = passthrough.meta["val"]
+                passthrough.meta["val"] = val.new_empty(
+                    val.shape, dtype=getattr(torch, f"uint{nbits}")
+                )
 
     graph.lint()
     return program

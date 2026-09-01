@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import warnings
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, cast
@@ -23,7 +24,9 @@ from coreai._compiler.ir import (
     InsertionPoint,
     Location,
     Module,
+    Operation,
     OpResultList,
+    OpView,
     StringAttr,
     Type,
     Value,
@@ -41,6 +44,11 @@ from ._composite_declaration import generate_composite_decl
 from ._compression.utils import inject_subbyte_tensors
 from ._custom_to_core import _custom_to_core_resolver
 from ._debug_locations import _DebugInfoRecorder
+from ._experimental._delegate import (
+    module_instance_key,
+    outline_ops_into_graph,
+    wrap_ops_in_isolated_group,
+)
 from ._torch_metal_kernel import TorchMetalKernel
 from ._utils import (
     _NARROW_TORCH_DTYPE,
@@ -155,6 +163,12 @@ class TorchConverter:
 
         # user defined torch op lowering (reusable across conversions)
         self._user_defined_torch_lowering: dict[str, Callable[..., Any]] = {}
+        self._delegate_ids: dict[str, str] = {}
+        self._entrypoint_delegate_ids: dict[str, str] = {}
+        self._externalize_groups: dict[str, str | Callable[[str], str]] = {}
+        self._externalize_group_marks: dict[str, bool] = {}
+        self._externalize_name_map: dict[str, str] = {}
+        self._matched_externalize_groups: set[str] = set()
 
         # staged programs awaiting conversion
         self._staged: list[_StagedEntry] = []
@@ -307,6 +321,142 @@ class TorchConverter:
         )
         return self
 
+    def _set_delegate_id(self: Self, module_class_name: str, target: str) -> Self:
+        """Run every instance of ``module_class_name`` on ``target``.
+
+        Wraps the ops each matched submodule contributed in ``coreai.isolated_group<target>``
+        once the graph body is built. Matched by leaf class name from ``nn_module_stack``,
+        one region per instance; a non-contiguous instance is skipped with a warning.
+        """
+        self._delegate_ids[module_class_name] = target
+        return self
+
+    def _set_entrypoint_delegate_id(
+        self: Self, entrypoint_name: str, target: str
+    ) -> Self:
+        """Run a whole procedure on ``target``.
+
+        Wraps the entire graph body in ``coreai.isolated_group<target>``, rather than the ops
+        one module class contributed. Placement is sometimes a property of the procedure and
+        not of any module inside it, and attribution cannot express that: a body that is a
+        single constant has no attributed op to match, and a module whose work is all done by
+        children owns none of the resulting ops.
+        """
+        self._entrypoint_delegate_ids[entrypoint_name] = target
+        return self
+
+    def _apply_delegate_ids(
+        self,
+        all_ops: list[OpView],
+        spans: dict[tuple[str, str], list[tuple[int, int]]],
+    ) -> None:
+        """Wrap each delegated instance's ops in an isolated_group.
+
+        ``spans`` gives the ``[start, end)`` op-index ranges each instance contributed,
+        indexing ``all_ops``. Non-contiguous ranges are skipped: the ops in between belong
+        to another module, and pulling them in would reorder unrelated computation.
+        """
+        for (path, cls), ranges in sorted(spans.items()):
+            start, end = ranges[0][0], ranges[-1][1]
+            if end - start != sum(hi - lo for lo, hi in ranges):
+                warnings.warn(
+                    f"_set_delegate_id({cls!r}): the ops for instance {path!r} are not "
+                    f"contiguous, so it was not delegated to "
+                    f"{self._delegate_ids[cls]!r}. This happens when another module's ops "
+                    f"are interleaved with it, including a nested delegated submodule.",
+                    stacklevel=2,
+                )
+                continue
+            wrap_ops_in_isolated_group(all_ops[start:end], self._delegate_ids[cls])
+
+    def _set_externalize_group(
+        self: Self,
+        module_class_name: str,
+        namespace: str | Callable[[str], str],
+        *,
+        externalize: bool = True,
+    ) -> Self:
+        """Externalize every instance of ``module_class_name`` into ``namespace``.
+
+        Each matched submodule's ops move into their own ``coreai.graph`` (marked
+        ``externalize``, inside ``namespace``) and are replaced by a ``coreai.invoke``.
+        ``externalize=False`` outlines a plain ``noinline`` graph, which resolves in-asset.
+        """
+        self._externalize_groups[module_class_name] = namespace
+        self._externalize_group_marks[module_class_name] = externalize
+        return self
+
+    def _set_externalize_name_map(self: Self, name_map: Mapping[str, str]) -> Self:
+        """Pin outlined graph names: ``{module path as traced: name to emit}``.
+
+        Graphs are named after the traced ``nn_module_stack`` path, so a procedure traced
+        after the module tree is restructured emits names an earlier procedure will not
+        match. Entries matching nothing are ignored. Returns ``self`` for chaining.
+        """
+        self._externalize_name_map.update(name_map)
+        return self
+
+    def _apply_externalize_groups(
+        self,
+        all_ops: list[OpView],
+        spans: dict[tuple[str, str], list[tuple[int, int]]],
+        entrypoint: str,
+    ) -> None:
+        """Outline each matched instance's ops into its own graph.
+
+        ``spans`` gives the ``[start, end)`` op-index ranges each instance contributed,
+        indexing ``all_ops``; see :meth:`_apply_delegate_ids` for why non-contiguous
+        instances cannot be grouped.
+        """
+        outlined: list[tuple[str, str, int, int]] = []
+        for (path, cls), ranges in sorted(spans.items()):
+            start, end = ranges[0][0], ranges[-1][1]
+            if end - start != sum(hi - lo for lo, hi in ranges):
+                warnings.warn(
+                    f"_set_externalize_group({cls!r}): the ops for instance {path!r} are "
+                    f"not contiguous, so it was not externalized into "
+                    f"{self._externalize_groups[cls]!r}. This happens when another "
+                    f"module's ops are interleaved with it.",
+                    stacklevel=2,
+                )
+                continue
+            outlined.append((path, cls, start, end))
+            self._matched_externalize_groups.add(cls)
+
+        for path, cls, start, end in outlined:
+            spec = self._externalize_groups[cls]
+            namespace = spec(entrypoint) if callable(spec) else spec
+            name = self._externalize_name_map.get(path, path)
+            graph = outline_ops_into_graph(
+                all_ops[start:end],
+                name,
+                callee="::@".join(namespace.split(".") + [name]),
+                externalize=self._externalize_group_marks.get(cls, True),
+            )
+            if graph is not None:
+                self._nest_graph_op(graph, namespace)
+
+    def _warn_unmatched_externalize_groups(self) -> None:
+        """Report classes registered for outlining that no op was attributed to.
+
+        ``nn_module_stack`` only records a module entered via ``__call__``, so a wrapper
+        delegating with ``self.inner.forward(...)`` keeps ``inner`` out of it -- and
+        conversion then succeeds while silently producing nothing.
+        """
+        unmatched = sorted(
+            set(self._externalize_groups) - self._matched_externalize_groups
+        )
+        if not unmatched:
+            return
+        warnings.warn(
+            f"_set_externalize_group: no ops were attributed to the following "
+            f"class(es), so nothing was externalized for them: {', '.join(unmatched)}. "
+            f"Check the class name, and that the module is invoked as `module(...)` "
+            f"rather than `module.forward(...)` -- only the former is recorded in "
+            f"nn_module_stack.",
+            stacklevel=2,
+        )
+
     def _run_externalize_pipeline_from_module(self) -> None:
         """Externalize from a live ``nn.Module`` + ``export_fn`` (Phases 1-3).
 
@@ -415,6 +565,45 @@ class TorchConverter:
         # asset. Left in, a model with three blocks reported Block$2, Block$3 and
         # Block$4, with no Block$1 anywhere.
         self._debug_info_recorder.reset_module_registry()
+
+    @staticmethod
+    def _nest_graph_op(graph_op: coreai.GraphOp, namespace: str) -> None:
+        """Move ``graph_op`` into nested symbol tables named by a dotted ``namespace``.
+
+        ``"a.b"`` gives ``udml.namespace @a { namespace @b { <graph> }}``, which is what
+        makes ``@a::@b::@<name>`` resolve; existing levels are reused. Not a nested
+        ``builtin.module``: that verifies in memory but is not serializable.
+        """
+        parent_block = graph_op.operation.parent.regions[0].blocks[0]
+        for level in namespace.split("."):
+            existing = None
+            for op in parent_block.operations:
+                if (
+                    op.operation.name == "udml.namespace"
+                    and "sym_name" in op.operation.attributes
+                    and StringAttr(op.operation.attributes["sym_name"]).value == level
+                ):
+                    existing = op
+                    break
+            if existing is None:
+                with InsertionPoint.at_block_begin(parent_block):
+                    # Carry the graph's own location. Without an explicit one the op
+                    # picks up whatever is ambient, which can be an unrepresentable
+                    # file location -- bytecode serialization then fails with
+                    #   Failed to serialize module to Bytecode: at
+                    #   #aicode.debuginfo.location_v1<src = <file = <filename = "-" ...
+                    # reported against this very module op.
+                    existing = Operation.create(
+                        "udml.namespace",
+                        attributes={"sym_name": StringAttr.get(level)},
+                        regions=1,
+                        loc=graph_op.location,
+                    )
+                existing.regions[0].blocks.append()
+            parent_block = existing.regions[0].blocks[0]
+
+        graph_op.operation.detach_from_parent()
+        parent_block.append(graph_op.operation)
 
     def _clean(self) -> None:
         """Reset all internal state dictionaries to empty.
@@ -828,13 +1017,50 @@ class TorchConverter:
             description = (
                 f"Converting {name}" if primary_entrypoint else "Converting submodule"
             )
+            delegate_spans: dict[tuple[str, str], list[tuple[int, int]]] = {}
+            group_spans: dict[tuple[str, str], list[tuple[int, int]]] = {}
             for node in self._progress_bar.track(
                 graph_module.graph.nodes,
                 description=description,
                 transient=not primary_entrypoint,
             ):
+                # Resolve attribution *before* converting: it only reads `node.meta`, while
+                # `len(block.operations)` walks the whole block. Measuring every node made
+                # conversion quadratic in graph size; only a node that belongs to a
+                # registered class needs its op span.
+                delegate_key: tuple[str, str] | None = None
+                group_key: tuple[str, str] | None = None
+                if self._delegate_ids:
+                    # Delegation keys on the leaf, externalization on the outermost match
+                    # -- see `module_instance_key`. A delegated module is a placement hint
+                    # for the ops it performed itself; an externalized one is a callable
+                    # boundary, so it has to take its children with it.
+                    leaf = module_instance_key(node)
+                    if leaf is not None and leaf[1] in self._delegate_ids:
+                        delegate_key = leaf
+                if self._externalize_groups:
+                    group_key = module_instance_key(node, self._externalize_groups)
+                measure = delegate_key is not None or group_key is not None
+
+                before = len(graph_op.entry_block.operations) if measure else 0
                 with graph_op.block:
                     self._get_operation(node)
+                if measure:
+                    after = len(graph_op.entry_block.operations)
+                    if after > before:
+                        if delegate_key is not None:
+                            delegate_spans.setdefault(delegate_key, []).append(
+                                (before, after)
+                            )
+                        if group_key is not None:
+                            group_spans.setdefault(group_key, []).append(
+                                (before, after)
+                            )
+
+            # Operation IDs and debug locations for everything just lowered, in one IR-order
+            # pass. Must precede the grouping rewrites below: those move operations into
+            # their own regions or graphs, out of reach of this graph's walk.
+            self._debug_info_recorder.finalize_node_operations()
 
             # Operation IDs and debug locations for everything just lowered, in one
             # IR-order pass, now that the graph body is complete.
@@ -880,6 +1106,31 @@ class TorchConverter:
                     )
                 arg_attr.append(DictAttr.get(attr_dict))
             graph_op.arg_attrs = ArrayAttr.get(arg_attr)
+
+            # After the terminator exists: a value consumed only by `coreai.output`
+            # must still be yielded out of the region.
+            if delegate_spans or (group_spans and primary_entrypoint):
+                # One snapshot for both groupings. The spans are op *indices* recorded
+                # while the block was being built, so they are only valid against the
+                # block as the loop left it -- and each grouping mutates it, replacing a
+                # run of ops with a single region or call. Resolving to op handles up
+                # front makes the two independent of each other's edits and of order.
+                all_ops = list(graph_op.entry_block.operations)
+                if delegate_spans:
+                    self._apply_delegate_ids(all_ops, delegate_spans)
+                if group_spans and primary_entrypoint:
+                    self._apply_externalize_groups(all_ops, group_spans, name)
+
+            target = self._entrypoint_delegate_ids.get(name)
+            if target is not None and primary_entrypoint:
+                # Everything except the terminator, which has to stay in the graph body.
+                body = [
+                    op
+                    for op in graph_op.entry_block.operations
+                    if op.name != "coreai.output"
+                ]
+                if body:
+                    wrap_ops_in_isolated_group(body, target)
 
         return graph_op
 
@@ -948,6 +1199,7 @@ class TorchConverter:
                             entry.entrypoint_name, primary_entrypoint=True
                         )
 
+        self._warn_unmatched_externalize_groups()
         return AIProgram._from_mlir_module(module)
 
     def clear(self, *, entrypoints: Sequence[str] | None = None) -> None:

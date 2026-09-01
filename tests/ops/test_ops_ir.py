@@ -12,7 +12,12 @@ from torch import Tensor
 
 import coreai_torch
 
-from ..utils import _all_dims_dynamic, filecheck_pattern, get_ir
+from ..utils import (
+    _all_dims_dynamic,
+    filecheck_pattern,
+    get_ir,
+    make_dynamic_shapes,
+)
 
 
 class TestUnaryOpsIR:
@@ -4605,6 +4610,40 @@ class TestIndexTensorIR:
                 // CHECK-NEXT:   }
                 // CHECK-NEXT: }
             """,
+        )
+
+    def test_two_indices_keep_statically_known_dims(self) -> None:
+        """Broadcasting index tensors must not drop dims torch already knows.
+
+        With two ``(1, S)`` index tensors and ``S`` dynamic, the common shape is built at
+        runtime, so result-type inference cannot see through it and drops *every* dim to
+        dynamic. Dim 0 is statically 1 on both indices, and losing it propagates through
+        the gather into the enclosing graph's signature.
+        """
+
+        class TwoIndexModel(nn.Module):
+            def forward(self, table: Tensor, i: Tensor, j: Tensor) -> Tensor:
+                return table[i, j]
+
+        ir = get_ir(
+            TwoIndexModel().eval(),
+            table=torch.rand(16, 16, 8),
+            i=torch.zeros(1, 4, dtype=torch.int64),
+            j=torch.zeros(1, 4, dtype=torch.int64),
+            # One shared Dim, so both indices carry the same dynamic length.
+            dynamic_shapes=make_dynamic_shapes(
+                table=[None, None, None], i=[None, "s"], j=[None, "s"]
+            ),
+        )
+        filecheck_pattern(
+            ir,
+            check_file="""
+                // CHECK: coreai.broadcast_to {{.*}} -> tensor<1x?xsi32>
+                // CHECK: coreai.gather_nd {{.*}} to tensor<1x?x8xf32>
+            """,
+        )
+        assert "tensor<?x?xsi32>" not in ir, (
+            "index broadcast dropped the statically known leading dim"
         )
 
 

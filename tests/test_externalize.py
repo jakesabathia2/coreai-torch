@@ -4103,3 +4103,62 @@ async def test_externalize_multiple_staged_entries_numerics() -> None:
     await _validate_numerics(
         coreai_program, plain_model, plain_sample, function_name="plain"
     )
+
+
+def test_wrapper_delegating_getattr_is_not_mistaken_for_marked() -> None:
+    """A wrapper that forwards unknown attributes to its child must not be restored.
+
+    Giving each instance a distinct class by wrapping it is a common trick, and such a
+    wrapper typically delegates via ``__getattr__``. That makes the marked child's stamps
+    read back off the *wrapper* too, so a ``hasattr``-based search finds a module that was
+    never patched -- and then cannot unpatch it, because the attributes it found are not
+    its own (``AttributeError: ... has no attribute '_original_forward'``).
+    """
+
+    class Inner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = nn.Linear(DIM, DIM, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.lin(x))
+
+    class Delegating(nn.Module):
+        def __init__(self, inner: nn.Module) -> None:
+            super().__init__()
+            self.add_module("wrapped", inner)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.wrapped.forward(x))
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            wrapped = self._modules.get("wrapped")
+            if wrapped is not None and hasattr(wrapped, name):
+                return getattr(wrapped, name)
+            return super().__getattr__(name)
+
+    class Net(nn.Module):
+        def __init__(self, inner: nn.Module) -> None:
+            super().__init__()
+            self.inner = Delegating(inner)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.inner(x) * 2.0
+
+    inner = Inner()
+    model = Net(inner)
+    _patch_model_for_externalization(model, [ExternalizeSpec(target_class=Inner)])
+    x = torch.randn(2, DIM)
+    ep = torch.export.export(model, (x,))
+    externalized = _subexport_and_restore(model, ep)
+    program = (
+        TorchConverter()
+        .add_exported_program(
+            ep.run_decompositions(get_decomp_table()),
+            entrypoint_name="main",
+            _externalized_exported_programs=externalized,
+        )
+        .to_coreai()
+    )
+    program._mlir_module.operation.verify()
+    assert not inner.__dict__.keys() & {"_original_forward", "_externalize_name"}

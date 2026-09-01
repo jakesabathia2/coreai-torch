@@ -869,7 +869,8 @@ def process_indices_with_transpose(
     target_rank = len(broadcast_shape)
     # Use static list for known shapes; use runtime broadcast_shapes for dynamic dims.
     # (coreai.constant([-1]) would produce UINT32_MAX after si32→ui32 cast.)
-    if not any(d < 0 for d in broadcast_shape):
+    static_shape = not any(d < 0 for d in broadcast_shape)
+    if static_shape:
         shape_arg: list[int] | Value = broadcast_shape
     else:
         # Compute broadcast shape at runtime via coreai.broadcast_shapes.
@@ -878,16 +879,38 @@ def process_indices_with_transpose(
         for s in shape_tensors[1:]:
             shape_arg = coreai.broadcast_shapes(shape_arg, s, loc=loc)
 
-    broadcasted = [
-        coreai.broadcast_to(
+    broadcasted = []
+    for idx in non_none_indices:
+        aligned_idx = (
             coreai.expand_dims(idx, list(range(target_rank - idx.type.rank)), loc=loc)
             if idx.type.rank < target_rank
-            else idx,
-            shape_arg,
-            loc=loc,
+            else idx
         )
-        for idx in non_none_indices
-    ]
+        if static_shape:
+            # `shape_arg` is a constant list, so inference already recovers every dim.
+            broadcasted.append(coreai.broadcast_to(aligned_idx, shape_arg, loc=loc))
+            continue
+        # Dynamic: `shape_arg` is a runtime value that inference cannot look through, so
+        # it drops *every* dim -- including ones known statically here. Indexing with two
+        # (1, S) tensors would come out (?, ?) instead of (1, ?), and that loss propagates
+        # through the gather into the enclosing graph's signature. Type it from the shape
+        # computed above instead.
+        broadcasted.append(
+            coreai.BroadcastToOp(
+                aligned_idx,
+                shape_arg,
+                results=[
+                    RankedTensorType.get(
+                        [
+                            d if d >= 0 else RankedTensorType.get_dynamic_size()
+                            for d in broadcast_shape
+                        ],
+                        idx.type.element_type,
+                    )
+                ],
+                loc=loc,
+            ).result
+        )
 
     # Reattach None slots.
     it = iter(broadcasted)

@@ -298,7 +298,7 @@ def _prepare_module(
     op_name = f"{_sanitize_op_name(name)}_{op_name_suffix}"
     qualified_name = f"{_EXTERNALIZE_NAMESPACE}::{op_name}"
 
-    if hasattr(submodule, "_original_forward"):
+    if "_original_forward" in submodule.__dict__:
         raise RuntimeError(
             f"submodule '{name}' is already marked for externalization "
             f"(missing a restore from a prior _patch_model_for_externalization call). "
@@ -463,10 +463,16 @@ def _find_marked_submodules(model: torch.nn.Module) -> list[torch.nn.Module]:
     them, so ``_subexport_and_restore`` rediscovers them this way each time
     it runs.
     """
+    # `__dict__` rather than `hasattr`: a wrapper module that delegates unknown
+    # attributes to a child (a common way to give a submodule a distinct class) would
+    # otherwise report its marked child's stamps as its own, and get "restored" -- a
+    # module that was never patched, whose stamps cannot be deleted because they are
+    # not on it. The stamps are always set through `__setattr__`, so they are always
+    # in the instance dict of the module that owns them.
     return [
         mod
         for name, mod in model.named_modules()
-        if name and hasattr(mod, "_externalize_name")
+        if name and "_externalize_name" in mod.__dict__
     ]
 
 
@@ -743,11 +749,11 @@ def _restore_externalized(marked: list[torch.nn.Module]) -> None:
     Called after the pipeline completes (or on error via ``finally``).
     """
     for mod in marked:
-        original = getattr(mod, "_original_forward", None)
+        original = mod.__dict__.get("_original_forward")
         if original is not None:
             mod.forward = original
             del mod._original_forward
             del mod._externalize_name
             del mod._externalize_op_name
-            if hasattr(mod, "_externalize_config"):
+            if "_externalize_config" in mod.__dict__:
                 del mod._externalize_config

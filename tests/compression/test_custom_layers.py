@@ -18,7 +18,10 @@ from coreai_torch._compression.custom_layers import (
     quantize,
     sparse_to_dense,
 )
-from coreai_torch._compression.utils import _inject_subbyte_in_quant
+from coreai_torch._compression.utils import (
+    _inject_subbyte_in_lut,
+    _inject_subbyte_in_quant,
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # constexpr_blockwise_shift_scale
@@ -585,6 +588,140 @@ def test_inject_subbyte_uses_input_dtype_arg(
     else:
         # nbits == 8 means no conversion (CHAR_BIT check skips it).
         assert not isinstance(converted, SubbyteTensor)
+
+
+@torch.library.custom_op("coreai_torch_test::lut_to_dense", mutates_args=())
+def _flat_lut_to_dense(lut: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """A foreign `lut_to_dense` with a flat lut and `coreai`'s operands reversed.
+
+    Models a downstream op (tamm-export has one) whose lut is
+    ``(num_blocks, num_palettes)`` and which reshapes to the ``coreai`` layout in its
+    own lowering rather than up front.
+    """
+    return lut.new_zeros(indices.shape)
+
+
+@_flat_lut_to_dense.register_fake
+def _(lut: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    return lut.new_empty(indices.shape)
+
+
+def _export_flat_lut_model(
+    num_blocks: int, num_palettes: int, out_channels: int = 32
+) -> torch.export.ExportedProgram:
+    """Export a model calling the flat-lut op on conv2d-shaped (rank-4) indices."""
+    indices_shape = (out_channels, 8, 1, 1)
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "palettized_indices",
+                torch.randint(0, num_palettes, indices_shape, dtype=torch.uint8),
+            )
+            self.register_buffer(
+                "palettized_lut",
+                torch.randn(num_blocks, num_palettes, dtype=torch.float16),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            weight = torch.ops.coreai_torch_test.lut_to_dense(
+                self.palettized_lut, self.palettized_indices
+            )
+            return x + weight
+
+    model = Model().eval()
+    with torch.no_grad():
+        return torch.export.export(
+            model, (torch.randn(indices_shape, dtype=torch.float16),)
+        )
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "num_palettes", "expected_nbits"),
+    [
+        # Block counts taken from a real 4-bit palettized model (out_channels / 16).
+        # Read at shape[-2] these gave 7 (raised), 6 (silently wrong) and 4 (right
+        # only by coincidence, both axes being 16) respectively.
+        pytest.param(200, 16, 4, id="200_blocks_was_7bit_error"),
+        pytest.param(64, 16, 4, id="64_blocks_was_silently_6bit"),
+        pytest.param(16, 16, 4, id="16_blocks_ambiguous"),
+        pytest.param(64, 4, 2, id="2bit"),
+    ],
+)
+def test_inject_subbyte_in_lut_flat_layout_uses_last_dim(
+    num_blocks: int, num_palettes: int, expected_nbits: int
+) -> None:
+    """A flat (num_blocks, num_palettes) lut must take its palette count from shape[-1].
+
+    The lut is rank 2 against rank-4 indices, so it is *not* in the coreai layout
+    (which would be rank 4 + 2 = 6) and shape[-2] is the block count.
+    """
+    program = _inject_subbyte_in_lut(_export_flat_lut_model(num_blocks, num_palettes))
+
+    indices_key = next(k for k in program.state_dict if "palettized_indices" in k)
+    converted = program.state_dict[indices_key]
+
+    assert isinstance(converted, SubbyteTensor), (
+        f"indices were not narrowed for a {num_palettes}-palette lut; "
+        f"got {type(converted)}"
+    )
+    assert converted.nbits == expected_nbits, (
+        f"lut of shape ({num_blocks}, {num_palettes}) inferred "
+        f"{converted.nbits}-bit, expected {expected_nbits}-bit -- the palette count "
+        f"was read off the wrong axis"
+    )
+
+
+# 3 is in PALETTIZATION_SUPPORT_NBITS but `UintxTensor.from_unpacked` only handles
+# 1/2/4/6, so a 3-bit lut fails in the packing step for reasons unrelated to the axis
+# choice under test here; 8 is skipped outright by the CHAR_BIT check.
+@pytest.mark.parametrize("nbits", [1, 2, 4, 6])
+def test_inject_subbyte_in_lut_coreai_layout_uses_second_last_dim(nbits: int) -> None:
+    """`coreai::lut_to_dense`'s own layout must still resolve at shape[-2].
+
+    Here `lut` is rank `indices.rank + 2` with the palette count at shape[-2] and a
+    vector size at shape[-1], so keying off rank has to pick the second-last axis --
+    shape[-1] would give a vector size of 1 and a nonsensical 0 bits.
+    """
+    indices_shape = (2, 3)
+    vector_size = 4
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "indices",
+                torch.randint(0, 2**nbits, indices_shape, dtype=torch.uint8),
+            )
+            self.register_buffer(
+                "lut",
+                torch.randn(1, 1, 2**nbits, vector_size, dtype=torch.float16),
+            )
+
+        def forward(self) -> torch.Tensor:
+            return torch.ops.coreai.lut_to_dense(self.indices, self.lut, 0)
+
+    model = Model().eval()
+    with torch.no_grad():
+        program = torch.export.export(model, ())
+
+    program = _inject_subbyte_in_lut(program)
+
+    indices_key = next(k for k in program.state_dict if "indices" in k)
+    converted = program.state_dict[indices_key]
+    assert isinstance(converted, SubbyteTensor)
+    assert converted.nbits == nbits
+
+
+def test_inject_subbyte_in_lut_rejects_non_power_of_two_palette_count() -> None:
+    """A count that is not 2**nbits must raise, not reach log2.
+
+    Without the check, `log2(12)` truncates to 3 and the indices are packed at a
+    width the lut cannot address -- a silent miscompression rather than an error.
+    """
+    with pytest.raises(RuntimeError, match="not a power of two"):
+        _inject_subbyte_in_lut(_export_flat_lut_model(4, 12))
 
 
 # ──────────────────────────────────────────────────────────────────────
