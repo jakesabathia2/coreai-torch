@@ -15,6 +15,7 @@ from torch import __version__ as _torch_version
 from .__version__ import __version__
 from ._composite_declaration import generate_composite_decl
 from ._decomp import get_decomp_table
+from ._externalize_graphs import _externalize_graphs
 from ._torch_metal_kernel import TorchMetalKernel
 from .converter import TorchConverter
 from .externalize import (
@@ -31,6 +32,7 @@ __all__ = [
     "TorchMetalKernel",
     "get_decomp_table",
     "generate_composite_decl",
+    "_externalize_graphs",
     "_patch_model_for_externalization",
     "_subexport_and_restore",
 ]

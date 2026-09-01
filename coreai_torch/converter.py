@@ -23,6 +23,7 @@ from coreai._compiler.ir import (
     InsertionPoint,
     Location,
     Module,
+    Operation,
     OpResultList,
     StringAttr,
     Type,
@@ -399,11 +400,28 @@ class TorchConverter:
                 composite_decl=composite_decl_attr,
             )
 
+            # `externalize` is set after construction rather than passed to
+            # `_get_graph_op`: the attribute is a plain UnitAttr and the op exposes a
+            # setter, so this avoids threading another flag through the builder.
+            if ext.graph_externalize:
+                graph_op.externalize = True
+
+            # Move the graph into its nested symbol tables, if requested, and call it
+            # through the qualified path (`@group_a::@stage_one::@name`). The graph is
+            # built at module top level first because `_get_graph_op` inserts at the
+            # ambient insertion point.
+            callee: str | None = None
+            if ext.namespace:
+                self._nest_graph_op(graph_op, ext.namespace)
+                callee = "::@".join(ext.namespace.split(".") + [ext.name])
+
             # Register per-node lowering: node.name → coreai.invoke @graph
             for node_name in ext.source_nodes:
                 self._externalized_lowerings[node_name] = (
-                    lambda values_map, node, loc, _gop=graph_op: get_invoke_from_graph(
-                        values_map, node, loc, _gop
+                    lambda values_map, node, loc, _gop=graph_op, _callee=callee: (
+                        get_invoke_from_graph(
+                            values_map, node, loc, _gop, callee=_callee
+                        )
                     )
                 )
 
@@ -415,6 +433,48 @@ class TorchConverter:
         # asset. Left in, a model with three blocks reported Block$2, Block$3 and
         # Block$4, with no Block$1 anywhere.
         self._debug_info_recorder.reset_module_registry()
+
+    @staticmethod
+    def _nest_graph_op(graph_op: coreai.GraphOp, namespace: str) -> None:
+        """Move ``graph_op`` into nested symbol tables named by a dotted ``namespace``.
+
+        ``"group_a.stage_one"`` produces::
+
+            module @group_a {
+              module @stage_one {
+                coreai.graph @<name>(...) { ... }
+              }
+            }
+
+        Nested ``builtin.module`` ops are used because the ``coreai`` dialect has no
+        module/namespace op of its own; a builtin module is a symbol table, which is
+        what makes the qualified reference ``@group_a::@stage_one::@<name>`` resolve.
+        Existing levels are reused, so every graph sharing a namespace lands in the
+        same modules rather than getting one wrapper each.
+        """
+        parent_block = graph_op.operation.parent.regions[0].blocks[0]
+        for level in namespace.split("."):
+            existing = None
+            for op in parent_block.operations:
+                if (
+                    op.operation.name == "builtin.module"
+                    and "sym_name" in op.operation.attributes
+                    and StringAttr(op.operation.attributes["sym_name"]).value == level
+                ):
+                    existing = op
+                    break
+            if existing is None:
+                with InsertionPoint.at_block_begin(parent_block):
+                    existing = Operation.create(
+                        "builtin.module",
+                        attributes={"sym_name": StringAttr.get(level)},
+                        regions=1,
+                    )
+                existing.regions[0].blocks.append()
+            parent_block = existing.regions[0].blocks[0]
+
+        graph_op.operation.detach_from_parent()
+        parent_block.append(graph_op.operation)
 
     def _clean(self) -> None:
         """Reset all internal state dictionaries to empty.

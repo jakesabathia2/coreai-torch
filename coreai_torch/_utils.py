@@ -901,9 +901,18 @@ def process_indices_with_transpose(
 
 
 def get_invoke_from_graph(
-    values_map: dict[str, Value], node: fx.Node, loc: Location, graph_op: coreai.GraphOp
+    values_map: dict[str, Value],
+    node: fx.Node,
+    loc: Location,
+    graph_op: coreai.GraphOp,
+    callee: str | None = None,
 ) -> list[OpResult]:
-    """Return the results of a coreai.invoke call targeting graph_op."""
+    """Return the results of a coreai.invoke call targeting graph_op.
+
+    ``callee`` overrides the symbol to call, for graphs that have been moved into
+    nested symbol tables and must be reached by a qualified path such as
+    ``"group_a::@stage_one::@name"``. Defaults to the graph's own flat symbol.
+    """
     operands = [
         get_operand(values_map, node, i, loc)
         for i, arg in enumerate(node.args)
@@ -911,7 +920,7 @@ def get_invoke_from_graph(
     ]
     result = coreai.invoke(
         results=[output.type for output in graph_op.outputs],
-        callee=graph_op.symbol_name,
+        callee=callee if callee is not None else graph_op.symbol_name,
         operands=operands,
         loc=loc,
     )

@@ -94,11 +94,25 @@ class ExternalizeSpec:
             and is marked ``private``.
         composite_attrs: Module attribute names (e.g. ``["eps"]``) whose values
             are included in ``composite_decl``. Requires ``composite_op_name``.
+        _graph_externalize: **Experimental, no backwards-compatibility guarantee.**
+            If True, the emitted ``coreai.graph`` is marked with the ``externalize``
+            attribute, so :func:`coreai_torch._externalize_graphs` can split it into a
+            separate artifact. Cannot be combined with ``composite_op_name``:
+            the op definition states ``externalize`` "may not be used with `private`",
+            and composite ops are emitted ``private``.
+        _namespace: **Experimental, no backwards-compatibility guarantee.**
+            Dotted path of nested symbol tables to place the graph in, e.g.
+            ``"group_a.stage_one"`` puts it in
+            ``module @group_a { module @stage_one { ... } }`` and makes the call site
+            ``coreai.invoke @group_a::@stage_one::@<name>``. Use it to group graphs
+            that ship together in one artifact.
     """
 
     target_class: type
     composite_op_name: str | None = None
     composite_attrs: list[str] | None = None
+    _graph_externalize: bool = False
+    _namespace: str | None = None
 
     def __post_init__(self) -> None:
         if self.composite_op_name is None:
@@ -111,6 +125,19 @@ class ExternalizeSpec:
                     f"ExternalizeSpec: {set_fields} can only be set when "
                     f"composite_op_name is provided."
                 )
+        elif self._graph_externalize:
+            raise ValueError(
+                "ExternalizeSpec: _graph_externalize cannot be combined with "
+                "composite_op_name. Composite ops are emitted `private`, and "
+                "`coreai.graph` may not carry both `externalize` and `private`."
+            )
+        if self._namespace is not None and not all(
+            part.isidentifier() for part in self._namespace.split(".")
+        ):
+            raise ValueError(
+                f"ExternalizeSpec: _namespace {self._namespace!r} must be a dotted "
+                f"path of identifiers, e.g. 'group_a.stage_one'."
+            )
 
 
 @dataclass
@@ -132,6 +159,8 @@ class _ExternalizedExportedProgram:
     source_nodes: list[str] = field(
         default_factory=list
     )  # FX node names for per-node dispatch
+    graph_externalize: bool = False  # emit the `externalize` attribute on the graph
+    namespace: str | None = None  # nested-symbol-table path, e.g. "group_a.stage_one"
 
 
 @dataclass
@@ -163,6 +192,8 @@ class _PreparedModule:
     source_nodes: list[fx.Node] = field(
         default_factory=list
     )  # FX nodes this _PreparedModule covers
+    graph_externalize: bool = False  # from ExternalizeSpec._graph_externalize
+    namespace: str | None = None  # from ExternalizeSpec._namespace
     _program_registry: _PreparedModules | None = field(default=None, repr=False)
 
 
@@ -272,7 +303,46 @@ def _finalize_module_export(
         composite_input_names=prep.composite_input_names,
         composite_output_names=prep.composite_output_names,
         source_nodes=[n.name for n in prep.source_nodes],
+        graph_externalize=prep.graph_externalize,
+        namespace=prep.namespace,
     )
+
+
+# Short dtype spellings for graph names, matching how the types print in Core AI IR
+# (`tensor<1x4xf16>` -> `f16`), so a symbol name reads like its signature.
+_DTYPE_TAG: dict[torch.dtype, str] = {
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+    torch.float64: "f64",
+    torch.int64: "si64",
+    torch.int32: "si32",
+    torch.int16: "si16",
+    torch.int8: "si8",
+    torch.uint8: "ui8",
+    torch.bool: "i1",
+}
+
+
+def _type_signature(fake_inputs: tuple[Any, ...] | list[Any]) -> str:
+    """A deterministic, symbol-safe tag for a call site's input types.
+
+    ``(FakeTensor[1,16,1,2] f32, FakeTensor[1,8,1,2] f32)`` becomes
+    ``tensor1x16x1x2f32_tensor1x8x1x2f32``. Non-tensor arguments contribute their
+    type name, so a differing constant still yields a distinct graph.
+
+    Stable across processes, and it simultaneously disambiguates shape
+    specialisations of the same module.
+    """
+    parts: list[str] = []
+    for value in fake_inputs:
+        if isinstance(value, torch.Tensor):
+            dims = "x".join(str(d) for d in value.shape)
+            tag = _DTYPE_TAG.get(value.dtype, str(value.dtype).replace("torch.", ""))
+            parts.append(f"tensor{dims}{tag}" if dims else f"tensor{tag}")
+        else:
+            parts.append(type(value).__name__)
+    return "_".join(parts) if parts else "void"
 
 
 def _prepare_module(
@@ -436,19 +506,44 @@ def _prepare_module_export(
     # One _PreparedModule per call site (node).  Even when two call sites have the same
     # argument count, each must get its own noinline graph so the runtime does
     # not deduplicate invocations of the same graph symbol.
+    #
+    # Naming depends on whether the graph is destined for its own artifact:
+    #
+    # * ``_graph_externalize`` -> derive the name from the module path plus the call
+    #   site's input type signature, so it is **reproducible across runs**. A
+    #   separately-exported base program and side artifact have to agree on symbol
+    #   names, which a random suffix cannot guarantee. Two call sites of the same
+    #   module with identical signatures get a trailing index.
+    # * otherwise -> keep the historical UUID suffix. Graphs that stay inside the one
+    #   module only need uniqueness, and renaming them would churn every existing IR
+    #   expectation for no benefit.
+    graph_externalize: bool = config._graph_externalize if config is not None else False
+    namespace: str | None = config._namespace if config is not None else None
+
     preps: list[_PreparedModule] = []
+    used: dict[str, int] = {}
     for node in all_nodes:
+        fake_inputs = _fake_inputs_from_node(node)
+        if graph_externalize:
+            candidate = f"{name}_spec_{_type_signature(fake_inputs)}"
+            seen = used.get(candidate, 0)
+            used[candidate] = seen + 1
+            graph_name = candidate if seen == 0 else f"{candidate}_{seen}"
+        else:
+            graph_name = f"{name}_{uuid4().hex[:8]}"
         preps.append(
             _PreparedModule(
-                name=f"{name}_{uuid4().hex[:8]}",
+                name=graph_name,
                 op_name=op_name,
                 module_path=name,
                 module=submodule,
-                fake_inputs=_fake_inputs_from_node(node),
+                fake_inputs=fake_inputs,
                 dynamic_shapes=_dynamic_shapes_from_node(node),
                 composite_op_name=composite_op_name,
                 composite_decl_attrs=composite_decl_attrs,
                 source_nodes=[node],
+                graph_externalize=graph_externalize,
+                namespace=namespace,
             )
         )
 
