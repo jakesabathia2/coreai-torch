@@ -1626,9 +1626,18 @@ def _dim_for_sym(s: torch.SymInt, cache: dict[str, Dim]) -> Dim:
     return cache[key]
 
 
-def _dynamic_shapes_from_node(node: fx.Node) -> tuple[dict[int, Dim] | None, ...]:
-    """Reconstruct a positional dynamic_shapes tuple from a custom op node's FakeTensors."""
-    cache: dict[str, Dim] = {}
+def _dynamic_shapes_from_node(node: fx.Node) -> tuple[dict[int, Any] | None, ...]:
+    """Reconstruct a positional dynamic_shapes tuple from a custom op node's FakeTensors.
+
+    Dynamic dims are marked ``Dim.AUTO`` rather than rebuilt as explicit ``Dim``s with
+    the parent's ranges. Copying those ranges asserts them on the submodule, and the
+    parent's range is often far looser than what the submodule's own arithmetic
+    permits -- a ``Dim.AUTO`` token dim in the parent arrives here as
+    ``[1, 2147483647]``, and a 1024-channel projection inside the submodule then
+    derives ``d <= 2147483647/1024``, which torch.export reports as a constraint
+    violation and the sub-export fails. Letting export infer the submodule's own
+    constraints avoids importing a bound that was never meant to be a promise.
+    """
     result = []
     for i, arg in enumerate(node.args):
         if arg is None:
@@ -1641,9 +1650,7 @@ def _dynamic_shapes_from_node(node: fx.Node) -> tuple[dict[int, Dim] | None, ...
                 f"supported for externalized submodules."
             )
         dims = {
-            j: _dim_for_sym(s, cache)
-            for j, s in enumerate(val.shape)
-            if isinstance(s, torch.SymInt)
+            j: Dim.AUTO for j, s in enumerate(val.shape) if isinstance(s, torch.SymInt)
         }
         result.append(dims or None)
     return tuple(result)
