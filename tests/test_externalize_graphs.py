@@ -300,12 +300,54 @@ def test_graphs_are_nested_under_a_namespace_ir() -> None:
         ],
     )
     check_file = """
-        // CHECK:   module @group_a {
-        // CHECK:     module @stage_one {
+        // CHECK:   udml.namespace @group_a {
+        // CHECK:     namespace @stage_one {
         // CHECK:       coreai.graph externalize noinline @
         // CHECK:   coreai.invoke @group_a::@stage_one::@
     """
     filecheck_pattern(str(program), check_file=check_file)
+
+
+def test_nested_graphs_survive_asset_serialization() -> None:
+    """A namespaced program must serialize, not just verify in memory.
+
+    Nesting is emitted with `udml.namespace` ops the converter creates directly. Two
+    things this catches that an IR check cannot: a nested `builtin.module` (the obvious
+    choice) is unserializable, and an op created without an explicit location inherits
+    whatever is ambient, which can be a location the bytecode writer cannot represent -- the module then verifies and
+    prints fine but `save_asset` fails with
+
+        Failed to serialize module to Bytecode: at #aicode.debuginfo.location_v1<
+            src = <file = <filename = "-", directory = "", sha256Sum = "">, ...
+
+    reported against the nested module op itself. An IR-only check cannot see this, so
+    this test writes the asset and reads it back.
+    """
+    torch.manual_seed(42)
+    program = _convert(
+        OneLayer().eval(),
+        [
+            ExternalizeSpec(
+                target_class=SideBranch,
+                _graph_externalize=True,
+                _namespace="group_a.stage_one",
+            )
+        ],
+    )
+
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "nested.aimodel"
+        program.save_asset(path)
+        assert (path / "main.mlirb").is_file()
+
+        from coreai.authoring import AIProgram
+
+        reloaded = str(
+            AIProgram._load_bytecode(path / "main.mlirb")._mlir_module  # noqa: SLF001
+        )
+        assert "udml.namespace @group_a" in reloaded, "namespace lost in round-trip"
+        assert "namespace @stage_one" in reloaded, "inner namespace lost in round-trip"
+        assert "@group_a::@stage_one::@" in reloaded, "qualified callee lost"
 
 
 def test_externalized_graph_names_are_deterministic() -> None:

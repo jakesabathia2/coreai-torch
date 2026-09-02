@@ -446,18 +446,25 @@ class TorchConverter:
               }
             }
 
-        Nested ``builtin.module`` ops are used because the ``coreai`` dialect has no
-        module/namespace op of its own; a builtin module is a symbol table, which is
-        what makes the qualified reference ``@group_a::@stage_one::@<name>`` resolve.
-        Existing levels are reused, so every graph sharing a namespace lands in the
-        same modules rather than getting one wrapper each.
+        ``udml.namespace`` is the nesting vehicle -- the ``coreai`` dialect has no
+        module op of its own, and it is what makes the qualified reference
+        ``@group_a::@stage_one::@<name>`` resolve. Existing levels are reused, so
+        every graph sharing a namespace lands in the same pair rather than getting one
+        wrapper each.
+
+        A nested ``builtin.module`` looks equivalent and verifies in memory, but is
+        **not serializable**: the writer wraps each module in an
+        ``aicode.serialization.asset``, which has no SymbolTable trait, so
+        ``save_asset`` fails with "'builtin.module' op symbol's parent must have the
+        SymbolTable trait". Only an IR-level check would miss that, which is why
+        ``test_nested_graphs_survive_asset_serialization`` writes and reloads an asset.
         """
         parent_block = graph_op.operation.parent.regions[0].blocks[0]
         for level in namespace.split("."):
             existing = None
             for op in parent_block.operations:
                 if (
-                    op.operation.name == "builtin.module"
+                    op.operation.name == "udml.namespace"
                     and "sym_name" in op.operation.attributes
                     and StringAttr(op.operation.attributes["sym_name"]).value == level
                 ):
@@ -465,10 +472,17 @@ class TorchConverter:
                     break
             if existing is None:
                 with InsertionPoint.at_block_begin(parent_block):
+                    # Carry the graph's own location. Without an explicit one the op
+                    # picks up whatever is ambient, which can be an unrepresentable
+                    # file location -- bytecode serialization then fails with
+                    #   Failed to serialize module to Bytecode: at
+                    #   #aicode.debuginfo.location_v1<src = <file = <filename = "-" ...
+                    # reported against this very module op.
                     existing = Operation.create(
-                        "builtin.module",
+                        "udml.namespace",
                         attributes={"sym_name": StringAttr.get(level)},
                         regions=1,
+                        loc=graph_op.location,
                     )
                 existing.regions[0].blocks.append()
             parent_block = existing.regions[0].blocks[0]

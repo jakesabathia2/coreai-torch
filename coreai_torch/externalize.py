@@ -100,6 +100,14 @@ class ExternalizeSpec:
             separate artifact. Cannot be combined with ``composite_op_name``:
             the op definition states ``externalize`` "may not be used with `private`",
             and composite ops are emitted ``private``.
+        _static_subexport: **Experimental, no backwards-compatibility guarantee.**
+            Export the submodule at the call site's *concrete* shapes, ignoring any
+            symbolic dims in its FX metadata. Needed when the parent's converted IR
+            specializes a dim that torch metadata still reports as symbolic (a reshape
+            to literal sizes does this): the sub-export would otherwise emit
+            ``tensor<...x?xf16>`` parameters while the call site passes a static
+            operand, and ``coreai.invoke`` rejects that with "input types did not
+            match callee signature".
         _namespace: **Experimental, no backwards-compatibility guarantee.**
             Dotted path of nested symbol tables to place the graph in, e.g.
             ``"group_a.stage_one"`` puts it in
@@ -113,6 +121,7 @@ class ExternalizeSpec:
     composite_attrs: list[str] | None = None
     _graph_externalize: bool = False
     _namespace: str | None = None
+    _static_subexport: bool = False
 
     def __post_init__(self) -> None:
         if self.composite_op_name is None:
@@ -194,6 +203,7 @@ class _PreparedModule:
     )  # FX nodes this _PreparedModule covers
     graph_externalize: bool = False  # from ExternalizeSpec._graph_externalize
     namespace: str | None = None  # from ExternalizeSpec._namespace
+    static_subexport: bool = False  # from ExternalizeSpec._static_subexport
     _program_registry: _PreparedModules | None = field(default=None, repr=False)
 
 
@@ -519,6 +529,7 @@ def _prepare_module_export(
     #   expectation for no benefit.
     graph_externalize: bool = config._graph_externalize if config is not None else False
     namespace: str | None = config._namespace if config is not None else None
+    static_subexport: bool = config._static_subexport if config is not None else False
 
     preps: list[_PreparedModule] = []
     used: dict[str, int] = {}
@@ -538,12 +549,15 @@ def _prepare_module_export(
                 module_path=name,
                 module=submodule,
                 fake_inputs=fake_inputs,
-                dynamic_shapes=_dynamic_shapes_from_node(node),
+                dynamic_shapes=(
+                    None if static_subexport else _dynamic_shapes_from_node(node)
+                ),
                 composite_op_name=composite_op_name,
                 composite_decl_attrs=composite_decl_attrs,
                 source_nodes=[node],
                 graph_externalize=graph_externalize,
                 namespace=namespace,
+                static_subexport=static_subexport,
             )
         )
 
